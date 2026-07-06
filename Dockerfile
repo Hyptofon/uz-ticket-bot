@@ -6,7 +6,10 @@ WORKDIR /app
 # Копіюємо файли залежностей
 COPY package*.json ./
 
-# Встановлюємо залежності
+# Встановлюємо залежності для збірки better-sqlite3 (make, g++, python)
+RUN apt-get update && apt-get install -y build-essential python3
+
+# Встановлюємо npm залежності
 RUN npm install
 
 # Копіюємо вихідний код
