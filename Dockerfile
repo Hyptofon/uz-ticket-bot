@@ -1,10 +1,22 @@
-# Використовуємо значно легший базовий образ (node:20-slim важить ~200МБ замість 4ГБ)
+# Використовуємо легкий базовий образ
 FROM node:20-slim
 
 WORKDIR /app
 
-# Встановлюємо залежності для збірки бази даних (make, g++, python)
-RUN apt-get update && apt-get install -y build-essential python3
+# Встановлюємо залежності для збірки бази даних та завантаження Chrome
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    python3 \
+    wget \
+    gnupg \
+    ca-certificates \
+    --no-install-recommends
+
+# Встановлюємо Google Chrome (офіційний пакет від Google)
+# Це той самий Chrome що й на локальному ПК — без CORS проблем
+RUN wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+    && apt-get install -y /tmp/chrome.deb \
+    && rm /tmp/chrome.deb
 
 # Копіюємо файли залежностей
 COPY package*.json ./
@@ -12,10 +24,8 @@ COPY package*.json ./
 # Встановлюємо npm залежності
 RUN npm install
 
-# Замість встановлення ВСІХ браузерів (Firefox, WebKit, Chromium), 
-# ми просимо Playwright завантажити ТІЛЬКИ Chromium і його системні бібліотеки.
-# Це економить близько 2.5 ГБ місця на диску!
-RUN npx playwright install --with-deps chromium
+# Встановлюємо системні залежності Playwright (без браузерів — Chrome вже встановлено)
+RUN npx playwright install-deps chromium
 
 # Копіюємо вихідний код
 COPY . .
@@ -29,5 +39,5 @@ RUN cp src/db/schema.sql dist/db/schema.sql
 # Вказуємо змінні середовища за замовчуванням
 ENV NODE_ENV=production
 
-# Запуск бота (використовуємо зібраний JS код)
+# Запуск бота
 CMD ["npm", "start"]

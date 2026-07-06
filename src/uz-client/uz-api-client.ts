@@ -72,7 +72,6 @@ export class UzApiClient {
   // Persistent browser context to bypass Cloudflare Turnstile TLS fingerprinting
   private browserContext: any = null;
   private browserPage: any = null;
-  private apiRequestContext: any = null;  // Playwright APIRequestContext — no CORS limits
   private browserInitPromise: Promise<void> | null = null;
   private browserSessionId: string | null = null;
   private sessionRefreshedAt: number = 0;
@@ -147,6 +146,7 @@ export class UzApiClient {
 
       this.browserContext = await chromium.launchPersistentContext(this.profileDir, {
         headless: true,
+        channel: 'chrome',
         userAgent: this.currentUA,
         args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
       });
@@ -174,9 +174,6 @@ export class UzApiClient {
         logger.info({ sessionId }, 'Harvested real x-session-id');
       }
 
-      // Create APIRequestContext from the browser context — it shares cookies but has NO CORS restrictions
-      this.apiRequestContext = await this.browserContext.request;
-
       this.sessionInitialized = true;
       this.sessionRefreshedAt = Date.now();
       logger.info('Background browser is ready.');
@@ -186,43 +183,41 @@ export class UzApiClient {
   }
 
   /**
-   * Make HTTP requests via Playwright APIRequestContext.
-   * This uses the browser's cookie jar (bypasses Cloudflare/Turnstile) but runs
-   * at the Node.js level — so CORS does NOT apply (unlike page.evaluate fetch).
+   * Execute fetch inside the background browser context via page.evaluate.
+   * The browser runs with --disable-web-security so CORS is not applied even
+   * on open-source Chromium builds (e.g. in Docker on Linux).
    */
   private async fetchViaBrowser(url: string, method: string = 'GET', body: any = null, contentType: string = 'application/json'): Promise<any> {
     await this.ensureBrowserReady();
     await rateLimitWait();
 
-    const headers: Record<string, string> = {
-      'Accept': 'application/json, text/plain, */*',
-      'X-Client-Locale': 'uk',
-      'X-User-Agent': 'UZ/2 Web/1 User/guest',
-      'Referer': 'https://booking.uz.gov.ua/',
-    };
-    if (this.browserSessionId) headers['X-Session-Id'] = this.browserSessionId;
+    return await this.browserPage.evaluate(async ({ reqUrl, reqMethod, reqBody, reqContentType, sessionId }: any) => {
+      const headers: Record<string, string> = {
+        'Accept': 'application/json, text/plain, */*',
+        'X-Client-Locale': 'uk',
+        'X-User-Agent': 'UZ/2 Web/1 User/guest',
+      };
+      if (sessionId) headers['X-Session-Id'] = sessionId;
+      if (reqBody) headers['Content-Type'] = reqContentType;
 
-    const options: any = { headers };
-    if (body) {
-      if (contentType === 'application/x-www-form-urlencoded') {
-        headers['Content-Type'] = contentType;
-        options.data = typeof body === 'string' ? body : new URLSearchParams(body).toString();
-      } else {
-        headers['Content-Type'] = 'application/json';
-        options.data = JSON.stringify(body);
+      const res = await fetch(reqUrl, {
+        method: reqMethod,
+        headers,
+        body: reqBody ?? undefined,
+      });
+
+      if (!res.ok) {
+        if (res.status === 403) throw new Error('BROWSER_FETCH_403');
+        throw new Error(`HTTP ${res.status}`);
       }
-    }
-
-    const apiReq = this.apiRequestContext;
-    const res = method === 'POST'
-      ? await apiReq.post(url, options)
-      : await apiReq.get(url, options);
-
-    if (!res.ok()) {
-      if (res.status() === 403) throw new Error('BROWSER_FETCH_403');
-      throw new Error(`HTTP ${res.status()}`);
-    }
-    return await res.json();
+      return await res.json();
+    }, {
+      reqUrl: url,
+      reqMethod: method,
+      reqBody: body ? (typeof body === 'string' ? body : JSON.stringify(body)) : null,
+      reqContentType: contentType,
+      sessionId: this.browserSessionId,
+    });
   }
 
   async refreshBrowserSession(): Promise<void> {
@@ -231,7 +226,6 @@ export class UzApiClient {
       await this.browserContext.close().catch(() => {});
       this.browserPage = null;
       this.browserContext = null;
-      this.apiRequestContext = null;
       this.browserInitPromise = null;
     }
     await this.ensureBrowserReady();
@@ -333,6 +327,8 @@ export class UzApiClient {
             throw browserErr;
           }
         }
+        // Log all other errors for debugging
+        logger.error({ err, attempt, fromStationId, toStationId, date }, 'searchTrains error');
         throw err;
       }
     }
@@ -423,7 +419,6 @@ export class UzApiClient {
 
         const url = `https://booking.uz.gov.ua/purchase/coaches/`;
         const data = await this.fetchViaBrowser(url, 'POST', formBody.toString(), 'application/x-www-form-urlencoded');
-
         return this.parseWagons(data);
       } catch (err: any) {
         if (err.message && err.message.includes('BROWSER_FETCH_403')) {
