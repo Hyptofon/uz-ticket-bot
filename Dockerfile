@@ -1,5 +1,5 @@
 # Використовуємо офіційний образ Playwright, який містить Node.js і всі системні залежності для браузерів
-FROM mcr.microsoft.com/playwright:v1.44.1-focal
+FROM mcr.microsoft.com/playwright:v1.44.1-jammy
 
 WORKDIR /app
 
