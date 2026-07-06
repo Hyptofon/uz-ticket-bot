@@ -69,10 +69,13 @@ export class UzApiClient {
   private sessionInitialized = false;
   private currentUA: string;
   private profileDir: string;
-  // Browser-harvested session (x-session-id + cookies from Vue app)
+  // Persistent browser context to bypass Cloudflare Turnstile TLS fingerprinting
+  private browserContext: any = null;
+  private browserPage: any = null;
+  private browserInitPromise: Promise<void> | null = null;
   private browserSessionId: string | null = null;
   private sessionRefreshedAt: number = 0;
-  private readonly SESSION_TTL_MS = 25 * 60 * 1000; // 25 хвили
+  private readonly SESSION_TTL_MS = 25 * 60 * 1000;
 
   constructor() {
     this.cookieJar = new CookieJar();
@@ -126,34 +129,37 @@ export class UzApiClient {
   }
 
   /**
-   * Відкриває Chrome один раз, завантажує booking.uz.gov.ua і витягує
-   * реальний x-session-id + cookies для всіх подальших axios-запитів.
+   * Initializes the persistent background browser ONCE.
+   * All API requests will be routed through this browser's fetch to inherit its TLS fingerprint.
    */
-  async refreshBrowserSession(): Promise<void> {
-    logger.info('Refreshing browser session (harvesting real sessionId + cookies)...');
-    let context;
-    try {
-      const { chromium } = await import('playwright');
+  async ensureBrowserReady(): Promise<void> {
+    if (this.browserPage) return;
+    if (this.browserInitPromise) return this.browserInitPromise;
+
+    this.browserInitPromise = (async () => {
+      logger.info('Initializing persistent background browser for Cloudflare bypass...');
+      const { chromium } = require('playwright-extra');
+      const stealth = require('puppeteer-extra-plugin-stealth')();
+      chromium.use(stealth);
+
       fs.mkdirSync(this.profileDir, { recursive: true });
 
-      context = await chromium.launchPersistentContext(this.profileDir, {
-        headless: true, // Без вікна — тільки для отримання сесії!
+      this.browserContext = await chromium.launchPersistentContext(this.profileDir, {
+        headless: true,
         channel: 'chrome',
         userAgent: this.currentUA,
         args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
       });
 
-      const page = await context.newPage();
-      // Відміняємо ознаку автоматизації
-      await page.addInitScript(() => {
+      this.browserPage = await this.browserContext.newPage();
+      await this.browserPage.addInitScript(() => {
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
       });
 
-      await page.goto('https://booking.uz.gov.ua/', { waitUntil: 'networkidle', timeout: 30000 });
-      await page.waitForTimeout(3000);
+      await this.browserPage.goto('https://booking.uz.gov.ua/', { waitUntil: 'networkidle', timeout: 45000 });
+      await this.browserPage.waitForTimeout(3000);
 
-      // Витягуємо sessionId з localStorage Vue-додатку
-      const sessionId = await page.evaluate((): string | null => {
+      const sessionId = await this.browserPage.evaluate((): string | null => {
         const raw = localStorage.getItem('Symbol(AUTH_STORE_ID)');
         if (!raw) return null;
         try { return JSON.parse(raw).sessionId ?? null; } catch { return null; }
@@ -161,153 +167,75 @@ export class UzApiClient {
 
       if (sessionId) {
         this.browserSessionId = sessionId;
-        logger.info({ sessionId }, 'Harvested real x-session-id from Vue localStorage');
-      } else {
-        logger.warn('Could not extract sessionId from localStorage');
+        logger.info({ sessionId }, 'Harvested real x-session-id');
       }
 
-      // Синхронізуємо cookies в axios jar
-      const cookies = await context.cookies();
-      for (const c of cookies) {
-        const domain = c.domain.startsWith('.') ? c.domain.slice(1) : c.domain;
-        const cookieStr = `${c.name}=${c.value}; Domain=${domain}; Path=${c.path}`;
-        await this.cookieJar.setCookie(cookieStr, `https://${domain}`);
-      }
-      logger.info({ count: cookies.length }, 'Synced browser cookies to axios jar');
-
+      this.sessionInitialized = true;
       this.sessionRefreshedAt = Date.now();
-      this.sessionInitialized = true;
-      await context.close();
-    } catch (err) {
-      logger.error({ err }, 'Failed to refresh browser session');
-      if (context) { try { await context.close(); } catch {} }
-    }
+      logger.info('Background browser is ready.');
+    })();
+
+    await this.browserInitPromise;
   }
 
-  /** Ініціалізація сесії: завантажити головну сторінку, отримати cookies */
-  async initSession(): Promise<void> {
-    if (this.sessionInitialized) return;
-
-    try {
-      logger.debug('Initializing UZ session...');
-      await rateLimitWait();
-      await this.httpClient.get('/', {
-        headers: { Accept: 'text/html,application/xhtml+xml' },
-      });
-      this.sessionInitialized = true;
-      logger.info('UZ session initialized (cookies obtained)');
-    } catch (err) {
-      logger.warn({ err }, 'Failed to initialize UZ session, will retry on next request');
-    }
-  }
-
-  /**
-   * Запасний метод для пошуку станцій через Playwright page.evaluate
+  /** 
+   * Execute fetch inside the background browser context.
+   * Bypasses Turnstile perfectly since it's an actual Chrome process.
    */
-  private async searchStationsViaBrowser(term: string): Promise<UzStation[]> {
-    logger.info({ term }, 'Axios blocked. Falling back to browser evaluation for stations...');
+  private async fetchViaBrowser(url: string, method: string = 'GET', body: any = null): Promise<any> {
+    await this.ensureBrowserReady();
+    await rateLimitWait();
     
-    // Очищаємо можливі заблоковані файли профілю Playwright перед запуском
-    const lockPath = path.join(this.profileDir, 'SingletonLock');
-    if (fs.existsSync(lockPath)) {
-      try {
-        fs.unlinkSync(lockPath);
-      } catch (e) {
-        logger.debug('Could not remove SingletonLock file, Chrome might handle it');
-      }
-    }
+    return await this.browserPage.evaluate(async ({ reqUrl, reqMethod, reqBody, sessionId }: any) => {
+      const headers: Record<string, string> = {
+        'Accept': 'application/json, text/plain, */*',
+        'X-Client-Locale': 'uk',
+        'X-User-Agent': 'UZ/2 Web/1 User/guest',
+      };
+      if (sessionId) headers['X-Session-Id'] = sessionId;
+      if (reqBody) headers['Content-Type'] = 'application/json';
 
-    let context;
-    try {
-      const { chromium } = await import('playwright');
-      fs.mkdirSync(this.profileDir, { recursive: true });
-
-      context = await chromium.launchPersistentContext(this.profileDir, {
-        headless: false, // Запускаємо з вікном, щоб Cloudflare пропустив
-        channel: 'chrome', // Запускаємо локальний Google Chrome
-        userAgent: this.currentUA,
+      const res = await fetch(reqUrl, {
+        method: reqMethod,
+        headers,
+        body: reqBody ? JSON.stringify(reqBody) : undefined,
       });
 
-      const page = await context.newPage();
-      
-      // Переходимо на новий сайт
-      await page.goto('https://booking.uz.gov.ua/', { waitUntil: 'domcontentloaded', timeout: 30000 });
-      logger.info('Waiting 5s for Cloudflare challenge check in Chrome window...');
-      await page.waitForTimeout(5000);
-
-      const result = await page.evaluate(async (searchTerm) => {
-        const url = `https://app.uz.gov.ua/api/stations?search=${encodeURIComponent(searchTerm)}`;
-        const response = await fetch(url, {
-          method: 'GET',
-          headers: {
-            'x-user-agent': 'UZ/2 Web/1 User/guest'
-          }
-        });
-        return response.json();
-      }, term);
-
-      await context.close();
-      return this.parseStations(result);
-    } catch (err) {
-      logger.error({ err }, 'Failed to search stations via Playwright fallback');
-      if (context) {
-        try {
-          await context.close();
-        } catch (e) {}
+      if (!res.ok) {
+        if (res.status === 403) throw new Error('BROWSER_FETCH_403');
+        throw new Error(`HTTP ${res.status}`);
       }
-      throw err;
+      return await res.json();
+    }, { reqUrl: url, reqMethod: method, reqBody: body, sessionId: this.browserSessionId });
+  }
+
+  async refreshBrowserSession(): Promise<void> {
+    logger.warn('Refreshing browser session manually...');
+    if (this.browserContext) {
+      await this.browserContext.close().catch(() => {});
+      this.browserPage = null;
+      this.browserContext = null;
+      this.browserInitPromise = null;
     }
+    await this.ensureBrowserReady();
   }
 
   /** Пошук станцій за рядком (автодоповнення) */
   async searchStations(term: string): Promise<UzStation[]> {
-    await this.initSession();
-    await rateLimitWait();
-
-    const maxRetries = 2;
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-      try {
-        const response: AxiosResponse = await this.httpClient.get(
-          'https://app.uz.gov.ua/api/stations',
-          {
-            params: { search: term },
-            headers: this.buildHeaders(),
-          },
-        );
-
-        if (isHtmlResponse(response.data)) {
-          logger.warn('UZ API returned HTML instead of JSON (possible CAPTCHA) for station search');
-          throw new CaptchaDetectedError('HTML response detected (captcha/block)');
-        }
-
-        const data = response.data;
-        const stations = this.parseStations(data);
-        logger.debug({ term, count: stations.length }, 'Station search completed');
-        return stations;
-      } catch (err) {
-        const axiosErr = err as AxiosError;
-        const isBlocked =
-          err instanceof CaptchaDetectedError ||
-          axiosErr.response?.status === 403 ||
-          axiosErr.response?.status === 401 ||
-          axiosErr.response?.status === 441;
-
-        if (isBlocked) {
-          try {
-            // Переключаємось на браузерний запит
-            return await this.searchStationsViaBrowser(term);
-          } catch (browserErr) {
-            if (attempt < maxRetries - 1) {
-              await sleep(backoffDelay(attempt));
-              continue;
-            }
-            throw browserErr;
-          }
-        }
-        throw err;
+    await this.ensureBrowserReady();
+    try {
+      const url = `https://app.uz.gov.ua/api/stations?search=${encodeURIComponent(term)}`;
+      const data = await this.fetchViaBrowser(url);
+      return this.parseStations(data);
+    } catch (err: any) {
+      if (err.message && err.message.includes('BROWSER_FETCH_403')) {
+        logger.warn('Browser fetch blocked (403) in searchStations. Refreshing...');
+        await this.refreshBrowserSession();
+        throw new CaptchaDetectedError('Оновлення сесії. Спробуйте ще раз.');
       }
+      logger.error({ err, term }, 'Failed to search stations via fetch');
+      return [];
     }
-    return [];
   }
 
   private parseStations(data: unknown): UzStation[] {
@@ -337,174 +265,7 @@ export class UzApiClient {
     }
   }
 
-  /**
-   * Запасний метод: симулює реального користувача на booking.uz.gov.ua
-   * Вводить станції, обирає зі списку підказок, обирає дату, клікає Знайти.
-   * Перехоплює API-відповідь від v3/trips і повертає список поїздів.
-   */
-  private async searchTrainsViaBrowser(fromId: string, toId: string, date: string, fromName?: string, toName?: string): Promise<UzTrain[]> {
-    logger.info({ fromId, toId, date, fromName, toName }, 'Falling back to browser UI simulation...');
 
-    if (!fromName || !toName) {
-      logger.warn('Cannot simulate UI without station names');
-      return [];
-    }
-
-    let context;
-    try {
-      const { chromium } = await import('playwright');
-      const fs = require('fs');
-      fs.mkdirSync(this.profileDir, { recursive: true });
-
-      context = await chromium.launchPersistentContext(this.profileDir, {
-        headless: false,
-        channel: 'chrome',
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      });
-
-      const page = await context.newPage();
-
-      // Helper: human typing with variable speed and mid-word pause
-      const humanType = async (el: any, text: string) => {
-        await el.fill('');
-        const part1 = text.substring(0, Math.max(2, Math.floor(text.length / 2)));
-        const part2 = text.substring(part1.length);
-        for (const ch of part1) {
-          await el.type(ch, { delay: Math.random() * 120 + 80 });
-        }
-        await page.waitForTimeout(500 + Math.random() * 500); // пауза — "думає"
-        for (const ch of part2) {
-          await el.type(ch, { delay: Math.random() * 100 + 70 });
-        }
-      };
-
-      // Helper: click autocomplete item by text
-      const clickAutocomplete = async (name: string): Promise<boolean> => {
-        await page.waitForTimeout(1200); // чекаємо список
-        // Спробуємо role=option
-        const opts = await page.$$('[role="option"]');
-        for (const opt of opts) {
-          const t = (await opt.innerText().catch(() => '')).trim();
-          if (t.toLowerCase().includes(name.toLowerCase())) {
-            await opt.click();
-            logger.info({ selected: t }, 'Selected from autocomplete via role=option');
-            return true;
-          }
-        }
-        // Запасний варіант: li елементи
-        const lis = await page.$$('li');
-        for (const li of lis) {
-          const t = (await li.innerText().catch(() => '')).trim();
-          if (t && t.toLowerCase().includes(name.toLowerCase())) {
-            await li.click();
-            logger.info({ selected: t }, 'Selected from autocomplete via li');
-            return true;
-          }
-        }
-        return false;
-      };
-
-      await page.goto('https://booking.uz.gov.ua/', { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await page.waitForTimeout(4000); // чекаємо завантаження Vue + CloudFlare
-
-      // Чекаємо появи полів
-      try {
-        await page.waitForSelector('#fromStation', { timeout: 15000 });
-      } catch {
-        logger.warn('fromStation input not found, page may be blocked');
-        await context.close();
-        return [];
-      }
-
-      // === КРОК 1: Станція відправлення ===
-      logger.info({ fromName }, 'Typing FROM station...');
-      await page.click('#fromStation');
-      await page.waitForTimeout(400);
-      await humanType(await page.$('#fromStation'), fromName);
-      const fromSelected = await clickAutocomplete(fromName);
-      if (!fromSelected) {
-        logger.warn({ fromName }, 'FROM autocomplete not found, aborting');
-        await context.close();
-        return [];
-      }
-      await page.waitForTimeout(600);
-
-      // === КРОК 2: Станція прибуття ===
-      logger.info({ toName }, 'Typing TO station...');
-      const inputs = await page.$$('input');
-      const toInput = inputs[1];
-      await toInput.click();
-      await page.waitForTimeout(400);
-      await humanType(toInput, toName);
-      const toSelected = await clickAutocomplete(toName);
-      if (!toSelected) {
-        logger.warn({ toName }, 'TO autocomplete not found, aborting');
-        await context.close();
-        return [];
-      }
-      await page.waitForTimeout(600);
-
-      // === КРОК 3: Дата ===
-      logger.info({ date }, 'Selecting date...');
-      const dateInput = await page.$('#startDate');
-      if (dateInput) {
-        await dateInput.click();
-        await page.waitForTimeout(1000);
-      }
-      let dateFound = false;
-      for (let i = 0; i < 4; i++) {
-        const el = await page.$(`#dp-${date}`);
-        if (el) {
-          await el.click();
-          dateFound = true;
-          logger.info({ date }, 'Date clicked in calendar');
-          break;
-        }
-        const next = await page.$('[aria-label="Next month"]');
-        if (next) { await next.click(); await page.waitForTimeout(700); } else break;
-      }
-      if (!dateFound) logger.warn({ date }, 'Date not found in calendar, using current');
-      await page.waitForTimeout(800);
-
-      // === КРОК 4: Встановлюємо перехоплення ПЕРЕД кліком Знайти ===
-      logger.info('Setting up response interceptor...');
-      const responsePromise = page.waitForResponse(
-        (res) => res.url().includes('v3/trips') && res.status() === 200,
-        { timeout: 25000 }
-      ).catch(() => null);
-
-      // === КРОК 5: Клік "Знайти" ===
-      logger.info('Clicking search button...');
-      const buttons = await page.$$('button');
-      for (const btn of buttons) {
-        const t = await btn.innerText().catch(() => '');
-        if (t.toLowerCase().includes('знайти')) {
-          await btn.click();
-          logger.info('Search button clicked');
-          break;
-        }
-      }
-
-      // === КРОК 6: Чекаємо на відповідь API ===
-      logger.info('Waiting for v3/trips API response...');
-      const response = await responsePromise;
-
-      if (response) {
-        logger.info({ status: response.status(), url: response.url() }, 'Got trips response!');
-        const result = await response.json();
-        await context.close();
-        return this.parseTrains(result);
-      } else {
-        logger.warn('Timed out — no v3/trips response intercepted');
-        await context.close();
-        return [];
-      }
-    } catch (err) {
-      logger.error({ err }, 'Failed in browser UI simulation');
-      if (context) { try { await context.close(); } catch (e) {} }
-      throw err;
-    }
-  }
 
   /** Пошук поїздів на маршруті/даті */
 
@@ -515,10 +276,8 @@ export class UzApiClient {
     fromName?: string,
     toName?: string
   ): Promise<UzTrain[]> {
-    await this.initSession();
-    await rateLimitWait();
+    await this.ensureBrowserReady();
 
-    // Формат дати для УЗ API: DD.MM.YYYY
     const [year, month, day] = date.split('-');
     const uzDate = `${day}.${month}.${year}`;
 
@@ -529,31 +288,26 @@ export class UzApiClient {
         const dateIso = `${y}-${m}-${d}`;
         const url = `https://app.uz.gov.ua/api/v3/trips?station_from_id=${fromStationId}&station_to_id=${toStationId}&with_transfers=0&date=${dateIso}`;
 
-        const response: AxiosResponse = await this.httpClient.get(url, {
-          headers: this.buildHeaders(),
-        });
+        const data = await this.fetchViaBrowser(url);
 
-        if (isHtmlResponse(response.data)) {
-          throw new CaptchaDetectedError('HTML response detected in train search');
-        }
-
-        const trains = this.parseTrains(response.data);
+        const trains = this.parseTrains(data);
         logger.debug(
           { fromStationId, toStationId, date, count: trains.length },
-          'Train search completed',
+          'Train search completed (via browser fetch)',
         );
         return trains;
-      } catch (err) {
-        const axiosErr = err as AxiosError;
-        const isBlocked =
-          err instanceof CaptchaDetectedError ||
-          axiosErr.response?.status === 403 ||
-          axiosErr.response?.status === 401 ||
-          axiosErr.response?.status === 441;
+      } catch (err: any) {
+        const isBlocked = err.message && err.message.includes('BROWSER_FETCH_403');
 
         if (isBlocked) {
+          logger.warn('Browser fetch blocked (403). Refreshing browser session...');
           try {
-            return await this.searchTrainsViaBrowser(fromStationId, toStationId, date, fromName, toName);
+            await this.refreshBrowserSession();
+            if (attempt < maxRetries - 1) {
+              await sleep(1000);
+              continue;
+            }
+            throw new Error('УЗ API недоступне (блок Cloudflare)');
           } catch (browserErr) {
             if (attempt < maxRetries - 1) {
               await sleep(backoffDelay(attempt));
@@ -626,60 +380,75 @@ export class UzApiClient {
     }
   }
 
-  /** Отримання вагонів для конкретного поїзда */
   async getWagons(
     trainNum: string,
     fromStationId: string,
     toStationId: string,
     date: string, // YYYY-MM-DD
   ): Promise<UzWagon[]> {
-    await this.initSession();
-    await rateLimitWait();
-
-    const [year, month, day] = date.split('-');
-    const uzDate = `${day}.${month}.${year}`;
-
-    const maxRetries = 3;
+    await this.ensureBrowserReady();
+    const maxRetries = 2;
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
+        // v3/wagons expects POST with JSON body:
+        // { from: "...", to: "...", date: "...", trainNumber: "...", model: 0 }
+        // Wait, the original method sent formData to /purchase/coaches/.
+        // Let's adapt it to use fetchViaBrowser with the original /purchase/coaches/ endpoint.
+        const [year, month, day] = date.split('-');
+        const uzDate = `${day}.${month}.${year}`;
+
         const formData = new URLSearchParams({
           from: fromStationId,
           to: toStationId,
           train: trainNum,
           date: uzDate,
-          // Час: беремо порожній або 00:00 — уточнити по API_NOTES.md
         });
 
-        const response: AxiosResponse = await this.httpClient.post(
-          '/purchase/coaches/',
-          formData.toString(),
-          {
-            headers: {
-              ...this.buildHeaders(),
-              'Content-Type': 'application/x-www-form-urlencoded',
-            },
-          },
-        );
+        const url = `https://booking.uz.gov.ua/purchase/coaches/`;
+        // Since it's application/x-www-form-urlencoded, we can pass it as a body string, but our fetch wrapper sets Content-Type to application/json if reqBody is present.
+        // Let's modify fetchViaBrowser call. Wait! If I just pass the string, fetchViaBrowser will stringify it again.
+        // Let's use GET /v3/wagons if possible... No, wait, let's just make fetchViaBrowser support urlencoded.
+        // Actually, the new architecture uses fetchViaBrowser for JSON. I'll just use page.evaluate directly here for the specific formData!
+        
+        const data = await this.browserPage.evaluate(async ({ reqUrl, reqBody, sessionId }: any) => {
+          const headers: Record<string, string> = {
+            'Accept': 'application/json, text/plain, */*',
+            'X-Client-Locale': 'uk',
+            'X-User-Agent': 'UZ/2 Web/1 User/guest',
+            'Content-Type': 'application/x-www-form-urlencoded'
+          };
+          if (sessionId) headers['X-Session-Id'] = sessionId;
 
-        if (isHtmlResponse(response.data)) {
-          throw new CaptchaDetectedError('HTML response detected in wagon request');
+          const res = await fetch(reqUrl, {
+            method: 'POST',
+            headers,
+            body: reqBody,
+          });
+
+          if (!res.ok) {
+            if (res.status === 403) throw new Error('BROWSER_FETCH_403');
+            throw new Error(`HTTP ${res.status}`);
+          }
+          return await res.json();
+        }, { reqUrl: url, reqBody: formData.toString(), sessionId: this.browserSessionId });
+
+        return this.parseWagons(data);
+      } catch (err: any) {
+        if (err.message && err.message.includes('BROWSER_FETCH_403')) {
+          logger.warn('Browser fetch blocked (403) in getWagons. Refreshing...');
+          try {
+            await this.refreshBrowserSession();
+            if (attempt < maxRetries - 1) {
+              await sleep(1000);
+              continue;
+            }
+            throw new Error('УЗ API недоступне (блок Cloudflare)');
+          } catch (browserErr) {
+            if (attempt < maxRetries - 1) continue;
+            throw browserErr;
+          }
         }
-
-        return this.parseWagons(response.data);
-      } catch (err) {
-        if (err instanceof CaptchaDetectedError) throw err;
-
-        const axiosErr = err as AxiosError;
-        logger.warn(
-          { err: axiosErr.message, attempt, trainNum },
-          'Wagon request failed',
-        );
-
-        if (attempt < maxRetries - 1) {
-          await sleep(backoffDelay(attempt));
-        } else {
-          throw err;
-        }
+        throw err;
       }
     }
     return [];

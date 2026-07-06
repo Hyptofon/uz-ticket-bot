@@ -1,46 +1,22 @@
-FROM node:20-alpine
-
-# Встановити залежності для Playwright (chromium) та better-sqlite3
-RUN apk add --no-cache \
-  python3 \
-  make \
-  g++ \
-  chromium \
-  nss \
-  freetype \
-  freetype-dev \
-  harfbuzz \
-  ca-certificates \
-  ttf-freefont
-
-# Дозволити Playwright знайти Chromium
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
-ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium-browser
+# Використовуємо офіційний образ Playwright, який містить Node.js і всі системні залежності для браузерів
+FROM mcr.microsoft.com/playwright:v1.44.1-focal
 
 WORKDIR /app
 
-# Спочатку копіюємо package.json для кешування шару залежностей
+# Копіюємо файли залежностей
 COPY package*.json ./
 
-# Встановити залежності (production + dev для build)
-RUN npm ci
+# Встановлюємо залежності
+RUN npm install
 
 # Копіюємо вихідний код
-COPY tsconfig.json ./
-COPY src/ ./src/
+COPY . .
 
-# Компілюємо TypeScript
+# Компілюємо TypeScript (переконайся, що в package.json є скрипт "build": "tsc")
 RUN npm run build
 
-# Прибираємо dev залежності
-RUN npm ci --only=production
+# Вказуємо змінні середовища за замовчуванням
+ENV NODE_ENV=production
 
-# Дані (SQLite DB) монтуються як volume
-VOLUME ["/app/data"]
-
-# Логи
-VOLUME ["/app/logs"]
-
-EXPOSE 3000
-
-CMD ["node", "dist/index.js"]
+# Запуск бота (використовуємо зібраний JS код)
+CMD ["npm", "start"]

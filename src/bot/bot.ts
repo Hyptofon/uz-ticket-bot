@@ -143,6 +143,44 @@ export function createBot(repo: Repository, uzClient: UzApiClient): Bot {
     );
   });
 
+  // ─── /stats ───
+  bot.command('stats', async (ctx) => {
+    const os = require('os');
+    const uptimeSec = process.uptime();
+    const days = Math.floor(uptimeSec / 86400);
+    const hours = Math.floor((uptimeSec % 86400) / 3600);
+    const minutes = Math.floor((uptimeSec % 3600) / 60);
+
+    const memUsage = process.memoryUsage();
+    const rssMb = (memUsage.rss / 1024 / 1024).toFixed(2);
+    
+    const activeMonitors = repo.getWorkableMonitors();
+    
+    // Знайти час останньої перевірки (максимальний last_checked_at серед усіх моніторів)
+    let lastChecked: Date | null = null;
+    const allMonitors = repo.getMonitorsByUserChatId(String(ctx.chat.id));
+    for (const m of allMonitors) {
+      if (m.last_checked_at) {
+        const d = new Date(m.last_checked_at);
+        if (!lastChecked || d > lastChecked) lastChecked = d;
+      }
+    }
+    
+    const lastCheckedStr = lastChecked 
+      ? lastChecked.toLocaleTimeString('uk-UA', { timeZone: 'Europe/Kyiv' }) 
+      : 'ніколи';
+
+    await ctx.reply(
+      `📊 <b>Статистика системи</b>\n\n` +
+      `🟢 <b>Uptime:</b> ${days}д ${hours}г ${minutes}хв\n` +
+      `🧠 <b>RAM (Бот):</b> ${rssMb} MB\n` +
+      `🚂 <b>Активних моніторів:</b> ${activeMonitors.length}\n` +
+      `🕒 <b>Останній пінг УЗ:</b> ${lastCheckedStr}\n\n` +
+      `<i>Все працює як швейцарський годинник 🇨🇭</i>`,
+      { parse_mode: 'HTML' }
+    );
+  });
+
   // ─── Inline callback handlers ───
   bot.on('callback_query:data', async (ctx) => {
     const data = ctx.callbackQuery.data;
