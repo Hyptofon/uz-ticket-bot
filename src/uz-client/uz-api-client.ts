@@ -107,7 +107,12 @@ export class UzApiClient {
         headless: true,
         channel: 'chrome',
         userAgent: this.currentUA,
-        args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
+        args: [
+          '--no-sandbox',
+          '--disable-blink-features=AutomationControlled',
+          '--disable-web-security',
+          '--allow-running-insecure-content',
+        ],
       });
 
       this.browserPage = await this.browserContext.newPage();
@@ -115,15 +120,26 @@ export class UzApiClient {
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
       });
 
-      // Відвідуємо booking.uz.gov.ua щоб отримати Cloudflare cookie
+      // 1. Відвідуємо спочатку app.uz.gov.ua (для trips/stations API)
+      try {
+        await this.browserPage.goto('https://app.uz.gov.ua/', {
+          waitUntil: 'domcontentloaded',
+          timeout: 45000,
+        });
+        await this.browserPage.waitForTimeout(3000);
+      } catch (err) {
+        logger.warn({ err: String(err) }, 'app.uz.gov.ua load timeout, continuing...');
+      }
+
+      // 2. Відвідуємо booking.uz.gov.ua (для wagons API)
       try {
         await this.browserPage.goto('https://booking.uz.gov.ua/', {
           waitUntil: 'domcontentloaded',
           timeout: 45000,
         });
-        await this.browserPage.waitForTimeout(5000);
+        await this.browserPage.waitForTimeout(3000);
       } catch (err) {
-        logger.warn({ err: String(err) }, 'Page load timeout, continuing anyway...');
+        logger.warn({ err: String(err) }, 'booking.uz.gov.ua load timeout, continuing...');
       }
 
       // Намагаємося витягнути session ID з localStorage
