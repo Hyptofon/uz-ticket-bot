@@ -23,6 +23,9 @@ COPY . .
 # Компілюємо TypeScript
 RUN npm run build
 
+# Копіюємо SQL файл схеми у скомпільовану папку
+RUN cp src/db/schema.sql dist/db/schema.sql
+
 # Вказуємо змінні середовища за замовчуванням
 ENV NODE_ENV=production
 
