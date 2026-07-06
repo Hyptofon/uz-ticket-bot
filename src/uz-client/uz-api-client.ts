@@ -95,11 +95,12 @@ export class UzApiClient {
       const stealth = require('puppeteer-extra-plugin-stealth')();
       chromium.use(stealth);
 
-      // Якщо профіль від старого Chromium — видаляємо щоб уникнути конфліктів з Chrome
+      // Видаляємо SingletonLock файл блокування Chrome, який міг лишитися з минулого запуску.
+      // Не використовуємо existsSync, бо для битих символьних лінків на Linux він повертає false.
       const lockFile = path.join(this.profileDir, 'SingletonLock');
-      if (fs.existsSync(lockFile)) {
-        try { fs.rmSync(lockFile); } catch { /* ignore */ }
-      }
+      try {
+        fs.rmSync(lockFile, { force: true });
+      } catch (e) {}
 
       fs.mkdirSync(this.profileDir, { recursive: true });
 
