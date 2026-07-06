@@ -146,7 +146,6 @@ export class UzApiClient {
 
       this.browserContext = await chromium.launchPersistentContext(this.profileDir, {
         headless: true,
-        channel: 'chrome',
         userAgent: this.currentUA,
         args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
       });
