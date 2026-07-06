@@ -72,6 +72,7 @@ export class UzApiClient {
   // Persistent browser context to bypass Cloudflare Turnstile TLS fingerprinting
   private browserContext: any = null;
   private browserPage: any = null;
+  private apiRequestContext: any = null;  // Playwright APIRequestContext — no CORS limits
   private browserInitPromise: Promise<void> | null = null;
   private browserSessionId: string | null = null;
   private sessionRefreshedAt: number = 0;
@@ -173,6 +174,9 @@ export class UzApiClient {
         logger.info({ sessionId }, 'Harvested real x-session-id');
       }
 
+      // Create APIRequestContext from the browser context — it shares cookies but has NO CORS restrictions
+      this.apiRequestContext = await this.browserContext.request;
+
       this.sessionInitialized = true;
       this.sessionRefreshedAt = Date.now();
       logger.info('Background browser is ready.');
@@ -181,35 +185,44 @@ export class UzApiClient {
     await this.browserInitPromise;
   }
 
-  /** 
-   * Execute fetch inside the background browser context.
-   * Bypasses Turnstile perfectly since it's an actual Chrome process.
+  /**
+   * Make HTTP requests via Playwright APIRequestContext.
+   * This uses the browser's cookie jar (bypasses Cloudflare/Turnstile) but runs
+   * at the Node.js level — so CORS does NOT apply (unlike page.evaluate fetch).
    */
-  private async fetchViaBrowser(url: string, method: string = 'GET', body: any = null): Promise<any> {
+  private async fetchViaBrowser(url: string, method: string = 'GET', body: any = null, contentType: string = 'application/json'): Promise<any> {
     await this.ensureBrowserReady();
     await rateLimitWait();
-    
-    return await this.browserPage.evaluate(async ({ reqUrl, reqMethod, reqBody, sessionId }: any) => {
-      const headers: Record<string, string> = {
-        'Accept': 'application/json, text/plain, */*',
-        'X-Client-Locale': 'uk',
-        'X-User-Agent': 'UZ/2 Web/1 User/guest',
-      };
-      if (sessionId) headers['X-Session-Id'] = sessionId;
-      if (reqBody) headers['Content-Type'] = 'application/json';
 
-      const res = await fetch(reqUrl, {
-        method: reqMethod,
-        headers,
-        body: reqBody ? JSON.stringify(reqBody) : undefined,
-      });
+    const headers: Record<string, string> = {
+      'Accept': 'application/json, text/plain, */*',
+      'X-Client-Locale': 'uk',
+      'X-User-Agent': 'UZ/2 Web/1 User/guest',
+      'Referer': 'https://booking.uz.gov.ua/',
+    };
+    if (this.browserSessionId) headers['X-Session-Id'] = this.browserSessionId;
 
-      if (!res.ok) {
-        if (res.status === 403) throw new Error('BROWSER_FETCH_403');
-        throw new Error(`HTTP ${res.status}`);
+    const options: any = { headers };
+    if (body) {
+      if (contentType === 'application/x-www-form-urlencoded') {
+        headers['Content-Type'] = contentType;
+        options.data = typeof body === 'string' ? body : new URLSearchParams(body).toString();
+      } else {
+        headers['Content-Type'] = 'application/json';
+        options.data = JSON.stringify(body);
       }
-      return await res.json();
-    }, { reqUrl: url, reqMethod: method, reqBody: body, sessionId: this.browserSessionId });
+    }
+
+    const apiReq = this.apiRequestContext;
+    const res = method === 'POST'
+      ? await apiReq.post(url, options)
+      : await apiReq.get(url, options);
+
+    if (!res.ok()) {
+      if (res.status() === 403) throw new Error('BROWSER_FETCH_403');
+      throw new Error(`HTTP ${res.status()}`);
+    }
+    return await res.json();
   }
 
   async refreshBrowserSession(): Promise<void> {
@@ -218,6 +231,7 @@ export class UzApiClient {
       await this.browserContext.close().catch(() => {});
       this.browserPage = null;
       this.browserContext = null;
+      this.apiRequestContext = null;
       this.browserInitPromise = null;
     }
     await this.ensureBrowserReady();
@@ -400,7 +414,7 @@ export class UzApiClient {
         const [year, month, day] = date.split('-');
         const uzDate = `${day}.${month}.${year}`;
 
-        const formData = new URLSearchParams({
+        const formBody = new URLSearchParams({
           from: fromStationId,
           to: toStationId,
           train: trainNum,
@@ -408,32 +422,7 @@ export class UzApiClient {
         });
 
         const url = `https://booking.uz.gov.ua/purchase/coaches/`;
-        // Since it's application/x-www-form-urlencoded, we can pass it as a body string, but our fetch wrapper sets Content-Type to application/json if reqBody is present.
-        // Let's modify fetchViaBrowser call. Wait! If I just pass the string, fetchViaBrowser will stringify it again.
-        // Let's use GET /v3/wagons if possible... No, wait, let's just make fetchViaBrowser support urlencoded.
-        // Actually, the new architecture uses fetchViaBrowser for JSON. I'll just use page.evaluate directly here for the specific formData!
-        
-        const data = await this.browserPage.evaluate(async ({ reqUrl, reqBody, sessionId }: any) => {
-          const headers: Record<string, string> = {
-            'Accept': 'application/json, text/plain, */*',
-            'X-Client-Locale': 'uk',
-            'X-User-Agent': 'UZ/2 Web/1 User/guest',
-            'Content-Type': 'application/x-www-form-urlencoded'
-          };
-          if (sessionId) headers['X-Session-Id'] = sessionId;
-
-          const res = await fetch(reqUrl, {
-            method: 'POST',
-            headers,
-            body: reqBody,
-          });
-
-          if (!res.ok) {
-            if (res.status === 403) throw new Error('BROWSER_FETCH_403');
-            throw new Error(`HTTP ${res.status}`);
-          }
-          return await res.json();
-        }, { reqUrl: url, reqBody: formData.toString(), sessionId: this.browserSessionId });
+        const data = await this.fetchViaBrowser(url, 'POST', formBody.toString(), 'application/x-www-form-urlencoded');
 
         return this.parseWagons(data);
       } catch (err: any) {
