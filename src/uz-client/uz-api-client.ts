@@ -1,20 +1,14 @@
 // src/uz-client/uz-api-client.ts
 //
-// UzApiClient — HTTP-клієнт до booking.uz.gov.ua
-// Інкапсулює заголовки, cookie jar, retry/backoff, парсинг відповіді.
-//
-// ВАЖЛИВО: booking.uz.gov.ua — неофіційне, недокументоване API.
-// Реальні ендпоінти підтверджені зворотньою розробкою (DevTools).
-// Якщо структура відповіді змінилась — шукати в src/uz-client/API_NOTES.md
+// UzApiClient — клієнт до booking.uz.gov.ua / app.uz.gov.ua
+// Весь трафік іде через постійний Google Chrome (Playwright) для обходу Cloudflare Turnstile.
 //
 // API_NOTES.md (оновлюється після probe-скрипта):
-//   GET /uk/train_search/station/?term={query} → масив станцій
-//   POST /uk/train_search/train/  → список поїздів
-//   GET /uk/train_search/coach/?  → список вагонів для поїзда
+//   GET  https://app.uz.gov.ua/api/stations?search={term}  → масив станцій
+//   GET  https://app.uz.gov.ua/api/v3/trips?...             → список поїздів
+//   POST https://booking.uz.gov.ua/purchase/coaches/        → список вагонів
 
-import axios, { AxiosInstance, AxiosError, AxiosResponse } from 'axios';
 import { CookieJar } from 'tough-cookie';
-import { wrapper } from 'axios-cookiejar-support';
 import { config } from '../config';
 import { logger } from '../logger';
 import { UzStation, UzTrain, UzWagon, UzTrainSearchResponse } from './types';
@@ -23,7 +17,7 @@ import { MonitorSnapshot, TrainSnapshot, WagonSnapshot } from '../db/types';
 import * as fs from 'fs';
 import * as path from 'path';
 
-// Затримка між глобальними запитами (rate-limit)
+// ─── Rate limiter ────────────────────────────────────────────────────────────
 let lastRequestTime = 0;
 
 async function rateLimitWait(): Promise<void> {
@@ -40,12 +34,11 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Exponential backoff: 5s → 10s → 20s → ... → 300s */
 function backoffDelay(attempt: number): number {
   return Math.min(5000 * Math.pow(2, attempt), 300_000);
 }
 
-/** Перевірка, чи відповідь містить HTML замість JSON (капча/блок Cloudflare) */
+/** Перевірка: чи відповідь є HTML (сторінка Cloudflare challenge) замість JSON */
 function isHtmlResponse(data: unknown): boolean {
   if (typeof data === 'string') {
     return data.trim().startsWith('<') || data.trim().includes('<!DOCTYPE html>');
@@ -63,13 +56,12 @@ function randomUA(): string {
   return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 }
 
+// ─── Main Client ──────────────────────────────────────────────────────────────
 export class UzApiClient {
-  private httpClient: AxiosInstance;
-  private cookieJar: CookieJar;
-  private sessionInitialized = false;
   private currentUA: string;
   private profileDir: string;
-  // Persistent browser context to bypass Cloudflare Turnstile TLS fingerprinting
+
+  // Постійний браузер Google Chrome для обходу Cloudflare Turnstile
   private browserContext: any = null;
   private browserPage: any = null;
   private browserInitPromise: Promise<void> | null = null;
@@ -77,60 +69,21 @@ export class UzApiClient {
   private sessionRefreshedAt: number = 0;
   private readonly SESSION_TTL_MS = 25 * 60 * 1000;
 
+  // Зберігаємо CookieJar тільки для сумісності з UzSessionManager
+  private cookieJar: CookieJar;
+  private sessionInitialized = false;
+
   constructor() {
-    this.cookieJar = new CookieJar();
     this.currentUA = randomUA();
     this.profileDir = path.join(process.cwd(), 'data', 'playwright-profile');
-
-    const rawClient = axios.create({
-      baseURL: config.uz.baseUrl,
-      timeout: 20_000,
-      headers: this.buildHeaders(),
-      withCredentials: true,
-    });
-
-    // axios-cookiejar-support: wrapper повертає той самий клієнт з cookie jar підтримкою
-    // Jar передаємо через defaults.jar (v1+ API)
-    try {
-      const wrappedClient = wrapper(rawClient);
-      if (wrappedClient && wrappedClient.defaults) {
-        (wrappedClient.defaults as unknown as { jar: CookieJar }).jar = this.cookieJar;
-        this.httpClient = wrappedClient;
-      } else {
-        // Fallback для тестового середовища де wrapper може повернути undefined
-        this.httpClient = rawClient;
-      }
-    } catch {
-      this.httpClient = rawClient;
-    }
+    this.cookieJar = new CookieJar();
   }
 
-  private buildHeaders(): Record<string, string> {
-    const headers: Record<string, string> = {
-      'User-Agent': this.currentUA,
-      'Accept': 'application/json, text/plain, */*',
-      'Accept-Language': 'uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7',
-      'Accept-Encoding': 'gzip, deflate, br',
-      'Referer': `${config.uz.baseUrl}/`,
-      'Origin': 'https://booking.uz.gov.ua',
-      'Sec-Ch-Ua': '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
-      'Sec-Ch-Ua-Mobile': '?0',
-      'Sec-Ch-Ua-Platform': '"Windows"',
-      'Sec-Fetch-Dest': 'empty',
-      'Sec-Fetch-Mode': 'cors',
-      'Sec-Fetch-Site': 'same-site',
-      'X-Client-Locale': 'uk',
-      'X-User-Agent': 'UZ/2 Web/1 User/guest',
-    };
-    if (this.browserSessionId) {
-      headers['X-Session-Id'] = this.browserSessionId;
-    }
-    return headers;
-  }
+  // ─── Browser Init ───────────────────────────────────────────────────────────
 
   /**
-   * Initializes the persistent background browser ONCE.
-   * All API requests will be routed through this browser's fetch to inherit its TLS fingerprint.
+   * Ініціалізує постійний Google Chrome ОДИН РАЗ.
+   * Всі API-запити йдуть через браузер — так обходиться Cloudflare TLS-fingerprinting.
    */
   async ensureBrowserReady(): Promise<void> {
     if (this.browserPage) return;
@@ -141,6 +94,12 @@ export class UzApiClient {
       const { chromium } = require('playwright-extra');
       const stealth = require('puppeteer-extra-plugin-stealth')();
       chromium.use(stealth);
+
+      // Якщо профіль від старого Chromium — видаляємо щоб уникнути конфліктів з Chrome
+      const lockFile = path.join(this.profileDir, 'SingletonLock');
+      if (fs.existsSync(lockFile)) {
+        try { fs.rmSync(lockFile); } catch { /* ignore */ }
+      }
 
       fs.mkdirSync(this.profileDir, { recursive: true });
 
@@ -156,18 +115,23 @@ export class UzApiClient {
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
       });
 
+      // Відвідуємо booking.uz.gov.ua щоб отримати Cloudflare cookie
       try {
-        await this.browserPage.goto('https://booking.uz.gov.ua/', { waitUntil: 'domcontentloaded', timeout: 45000 });
-        await this.browserPage.waitForTimeout(5000); // Give it a few seconds to run React scripts
+        await this.browserPage.goto('https://booking.uz.gov.ua/', {
+          waitUntil: 'domcontentloaded',
+          timeout: 45000,
+        });
+        await this.browserPage.waitForTimeout(5000);
       } catch (err) {
-        logger.warn({ err: String(err) }, 'Page load timeout, but continuing...');
+        logger.warn({ err: String(err) }, 'Page load timeout, continuing anyway...');
       }
 
+      // Намагаємося витягнути session ID з localStorage
       const sessionId = await this.browserPage.evaluate((): string | null => {
         const raw = localStorage.getItem('Symbol(AUTH_STORE_ID)');
         if (!raw) return null;
         try { return JSON.parse(raw).sessionId ?? null; } catch { return null; }
-      });
+      }).catch(() => null);
 
       if (sessionId) {
         this.browserSessionId = sessionId;
@@ -182,43 +146,71 @@ export class UzApiClient {
     await this.browserInitPromise;
   }
 
+  // ─── Core Fetch ─────────────────────────────────────────────────────────────
+
   /**
-   * Execute fetch inside the background browser context via page.evaluate.
-   * The browser runs with --disable-web-security so CORS is not applied even
-   * on open-source Chromium builds (e.g. in Docker on Linux).
+   * Виконує fetch всередині Google Chrome через page.evaluate.
+   * Chrome вже пройшов Cloudflare, тому всі запити проходять без блокування.
+   * contentType — 'application/json' (default) або 'application/x-www-form-urlencoded'
    */
-  private async fetchViaBrowser(url: string, method: string = 'GET', body: any = null, contentType: string = 'application/json'): Promise<any> {
+  private async fetchViaBrowser(
+    url: string,
+    method: string = 'GET',
+    body: any = null,
+    contentType: string = 'application/json',
+  ): Promise<any> {
     await this.ensureBrowserReady();
     await rateLimitWait();
 
-    return await this.browserPage.evaluate(async ({ reqUrl, reqMethod, reqBody, reqContentType, sessionId }: any) => {
-      const headers: Record<string, string> = {
-        'Accept': 'application/json, text/plain, */*',
-        'X-Client-Locale': 'uk',
-        'X-User-Agent': 'UZ/2 Web/1 User/guest',
-      };
-      if (sessionId) headers['X-Session-Id'] = sessionId;
-      if (reqBody) headers['Content-Type'] = reqContentType;
+    const result = await this.browserPage.evaluate(
+      async ({ reqUrl, reqMethod, reqBody, reqContentType, sessionId }: any) => {
+        const headers: Record<string, string> = {
+          'Accept': 'application/json, text/plain, */*',
+          'X-Client-Locale': 'uk',
+          'X-User-Agent': 'UZ/2 Web/1 User/guest',
+        };
+        if (sessionId) headers['X-Session-Id'] = sessionId;
+        if (reqBody) headers['Content-Type'] = reqContentType;
 
-      const res = await fetch(reqUrl, {
-        method: reqMethod,
-        headers,
-        body: reqBody ?? undefined,
-      });
+        const res = await fetch(reqUrl, {
+          method: reqMethod,
+          headers,
+          body: reqBody ?? undefined,
+        });
 
-      if (!res.ok) {
-        if (res.status === 403) throw new Error('BROWSER_FETCH_403');
-        throw new Error(`HTTP ${res.status}`);
-      }
-      return await res.json();
-    }, {
-      reqUrl: url,
-      reqMethod: method,
-      reqBody: body ? (typeof body === 'string' ? body : JSON.stringify(body)) : null,
-      reqContentType: contentType,
-      sessionId: this.browserSessionId,
-    });
+        if (!res.ok) {
+          if (res.status === 403) throw new Error('BROWSER_FETCH_403');
+          throw new Error(`HTTP ${res.status}`);
+        }
+
+        // Повертаємо текст, щоб перевірити на HTML (Cloudflare challenge)
+        const text = await res.text();
+        return text;
+      },
+      {
+        reqUrl: url,
+        reqMethod: method,
+        reqBody: body ? (typeof body === 'string' ? body : JSON.stringify(body)) : null,
+        reqContentType: contentType,
+        sessionId: this.browserSessionId,
+      },
+    );
+
+    // Перевіряємо чи це не HTML сторінка Cloudflare
+    if (isHtmlResponse(result)) {
+      logger.warn({ url }, 'Got HTML response instead of JSON — Cloudflare challenge detected');
+      throw new Error('BROWSER_FETCH_403');
+    }
+
+    try {
+      return JSON.parse(result);
+    } catch {
+      logger.error({ url, result: result?.slice?.(0, 200) }, 'Failed to parse JSON response');
+      throw new Error('Invalid JSON response from UZ API');
+    }
   }
+
+  // ─── Session Management ─────────────────────────────────────────────────────
 
   async refreshBrowserSession(): Promise<void> {
     logger.warn('Refreshing browser session manually...');
@@ -231,27 +223,35 @@ export class UzApiClient {
     await this.ensureBrowserReady();
   }
 
+  // Методи для сумісності з UzSessionManager (не видаляємо — використовуються в fsm.ts і worker)
+  getCookieJar(): CookieJar { return this.cookieJar; }
+  getUserAgent(): string { return this.currentUA; }
+  resetSession(): void { this.currentUA = randomUA(); logger.info('UA rotated'); }
+  setSessionInitialized(v: boolean): void { this.sessionInitialized = v; }
+
+  // ─── Public API Methods ─────────────────────────────────────────────────────
+
   /** Пошук станцій за рядком (автодоповнення) */
   async searchStations(term: string): Promise<UzStation[]> {
-    await this.ensureBrowserReady();
     try {
       const url = `https://app.uz.gov.ua/api/stations?search=${encodeURIComponent(term)}`;
       const data = await this.fetchViaBrowser(url);
-      return this.parseStations(data);
+      const stations = this.parseStations(data);
+      logger.info({ term, count: stations.length }, 'Stations found');
+      return stations;
     } catch (err: any) {
-      if (err.message && err.message.includes('BROWSER_FETCH_403')) {
-        logger.warn('Browser fetch blocked (403) in searchStations. Refreshing...');
+      if (err.message?.includes('BROWSER_FETCH_403')) {
+        logger.warn({ term }, 'Station search blocked (403). Refreshing session...');
         await this.refreshBrowserSession();
         throw new CaptchaDetectedError('Оновлення сесії. Спробуйте ще раз.');
       }
-      logger.error({ err, term }, 'Failed to search stations via fetch');
+      logger.error({ err: err.message, term }, 'searchStations error');
       return [];
     }
   }
 
   private parseStations(data: unknown): UzStation[] {
     try {
-      // Формат 1: масив об'єктів [{station_id, title}]
       if (Array.isArray(data)) {
         return data.map((item: Record<string, unknown>) => ({
           station_id: String(item.station_id ?? item.id ?? item.value ?? ''),
@@ -259,33 +259,25 @@ export class UzApiClient {
           type: String(item.type ?? ''),
         })).filter(s => s.station_id && s.title);
       }
-
-      // Формат 2: {data: [{...}]}
       if (data && typeof data === 'object' && 'data' in data) {
         const inner = (data as Record<string, unknown>).data;
-        if (Array.isArray(inner)) {
-          return this.parseStations(inner);
-        }
+        if (Array.isArray(inner)) return this.parseStations(inner);
       }
-
       logger.warn({ data: JSON.stringify(data).slice(0, 200) }, 'Unknown station response format');
       return [];
     } catch (err) {
-      logger.error({ err, data }, 'Failed to parse station response');
+      logger.error({ err }, 'Failed to parse station response');
       return [];
     }
   }
 
-
-
   /** Пошук поїздів на маршруті/даті */
-
   async searchTrains(
     fromStationId: string,
     toStationId: string,
     date: string, // YYYY-MM-DD
     fromName?: string,
-    toName?: string
+    toName?: string,
   ): Promise<UzTrain[]> {
     await this.ensureBrowserReady();
 
@@ -300,35 +292,25 @@ export class UzApiClient {
         const url = `https://app.uz.gov.ua/api/v3/trips?station_from_id=${fromStationId}&station_to_id=${toStationId}&with_transfers=0&date=${dateIso}`;
 
         const data = await this.fetchViaBrowser(url);
-
         const trains = this.parseTrains(data);
-        logger.debug(
-          { fromStationId, toStationId, date, count: trains.length },
-          'Train search completed (via browser fetch)',
-        );
+        logger.info({ fromStationId, toStationId, date, count: trains.length }, 'Train search completed');
         return trains;
       } catch (err: any) {
-        const isBlocked = err.message && err.message.includes('BROWSER_FETCH_403');
+        const isBlocked = err.message?.includes('BROWSER_FETCH_403');
 
         if (isBlocked) {
-          logger.warn('Browser fetch blocked (403). Refreshing browser session...');
+          logger.warn({ attempt }, 'Train search blocked (403). Refreshing browser session...');
           try {
             await this.refreshBrowserSession();
-            if (attempt < maxRetries - 1) {
-              await sleep(1000);
-              continue;
-            }
+            if (attempt < maxRetries - 1) { await sleep(1000); continue; }
             throw new Error('УЗ API недоступне (блок Cloudflare)');
           } catch (browserErr) {
-            if (attempt < maxRetries - 1) {
-              await sleep(backoffDelay(attempt));
-              continue;
-            }
+            if (attempt < maxRetries - 1) { await sleep(backoffDelay(attempt)); continue; }
             throw browserErr;
           }
         }
-        // Log all other errors for debugging
-        logger.error({ err, attempt, fromStationId, toStationId, date }, 'searchTrains error');
+
+        logger.error({ err: err.message, attempt, fromStationId, toStationId, date }, 'searchTrains error');
         throw err;
       }
     }
@@ -343,11 +325,9 @@ export class UzApiClient {
       if (obj && Array.isArray((obj as any).direct)) {
         return (obj as any).direct.map((item: any) => {
           const t = item.train;
-          // Конвертуємо Unix timestamp в людський час (Київ, UTC+3)
           const toKyivTime = (ts: number): string => {
             if (!ts) return '--:--';
             const d = new Date(ts * 1000);
-            const h = String(d.getUTCHours() + 3).padStart(2, '0');
             const hNum = d.getUTCHours() + 3;
             const hFinal = String(hNum >= 24 ? hNum - 24 : hNum).padStart(2, '0');
             const m = String(d.getUTCMinutes()).padStart(2, '0');
@@ -364,7 +344,7 @@ export class UzApiClient {
               id: wc.id,
               title: wc.name,
               places: wc.free_seats,
-              price: wc.price, // v3 returns in kopecks
+              price: wc.price,
             }))
           };
         }) as UzTrain[];
@@ -378,16 +358,11 @@ export class UzApiClient {
         (Array.isArray(data) ? (data as UzTrain[]) : null);
 
       if (!list || !Array.isArray(list)) {
-        logger.warn(
-          { data: JSON.stringify(data).slice(0, 300) },
-          'Unknown train search response format',
-        );
+        logger.warn({ data: JSON.stringify(data).slice(0, 300) }, 'Unknown train search response format');
         return [];
       }
-
       return list;
     } catch (err) {
-      // Парсер не падає весь процес — логуємо і повертаємо []
       logger.error({ err, raw: JSON.stringify(data).slice(0, 500) }, 'Failed to parse train list');
       return [];
     }
@@ -400,13 +375,10 @@ export class UzApiClient {
     date: string, // YYYY-MM-DD
   ): Promise<UzWagon[]> {
     await this.ensureBrowserReady();
+
     const maxRetries = 2;
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
-        // v3/wagons expects POST with JSON body:
-        // { from: "...", to: "...", date: "...", trainNumber: "...", model: 0 }
-        // Wait, the original method sent formData to /purchase/coaches/.
-        // Let's adapt it to use fetchViaBrowser with the original /purchase/coaches/ endpoint.
         const [year, month, day] = date.split('-');
         const uzDate = `${day}.${month}.${year}`;
 
@@ -421,20 +393,18 @@ export class UzApiClient {
         const data = await this.fetchViaBrowser(url, 'POST', formBody.toString(), 'application/x-www-form-urlencoded');
         return this.parseWagons(data);
       } catch (err: any) {
-        if (err.message && err.message.includes('BROWSER_FETCH_403')) {
-          logger.warn('Browser fetch blocked (403) in getWagons. Refreshing...');
+        if (err.message?.includes('BROWSER_FETCH_403')) {
+          logger.warn({ attempt }, 'Wagons fetch blocked (403). Refreshing...');
           try {
             await this.refreshBrowserSession();
-            if (attempt < maxRetries - 1) {
-              await sleep(1000);
-              continue;
-            }
+            if (attempt < maxRetries - 1) { await sleep(1000); continue; }
             throw new Error('УЗ API недоступне (блок Cloudflare)');
           } catch (browserErr) {
             if (attempt < maxRetries - 1) continue;
             throw browserErr;
           }
         }
+        logger.error({ err: err.message, attempt, trainNum }, 'getWagons error');
         throw err;
       }
     }
@@ -450,13 +420,9 @@ export class UzApiClient {
         (Array.isArray(data) ? (data as UzWagon[]) : null);
 
       if (!wagons || !Array.isArray(wagons)) {
-        logger.warn(
-          { data: JSON.stringify(data).slice(0, 300) },
-          'Unknown wagon response format',
-        );
+        logger.warn({ data: JSON.stringify(data).slice(0, 300) }, 'Unknown wagon response format');
         return [];
       }
-
       return wagons;
     } catch (err) {
       logger.error({ err }, 'Failed to parse wagon response');
@@ -466,7 +432,6 @@ export class UzApiClient {
 
   /**
    * Головний метод для Worker — отримати знімок доступності для монітора.
-   * Повертає MonitorSnapshot з усіма поїздами та їх вагонами.
    */
   async getAvailabilitySnapshot(
     fromStationId: string,
@@ -487,7 +452,6 @@ export class UzApiClient {
     const trainSnapshots: TrainSnapshot[] = [];
 
     for (const train of filteredTrains) {
-      // Якщо у відповіді вже є типи з місцями — використовуємо їх
       if (train.types && Array.isArray(train.types) && train.types.length > 0) {
         const wagonSnaps = train.types
           .filter((wt) => !wagonTypes || this.matchesWagonType(wt.title || wt.id, wagonTypes))
@@ -547,26 +511,6 @@ export class UzApiClient {
       if (position === 'upper') return w.freeSeatsUpper > 0;
       return true;
     });
-  }
-
-  /** Скинути сесію (використовується при блокуванні) */
-  resetSession(): void {
-    this.cookieJar = new CookieJar();
-    this.sessionInitialized = false;
-    this.currentUA = randomUA();
-    logger.info('UZ session reset');
-  }
-
-  getCookieJar(): CookieJar {
-    return this.cookieJar;
-  }
-
-  getUserAgent(): string {
-    return this.currentUA;
-  }
-
-  setSessionInitialized(initialized: boolean): void {
-    this.sessionInitialized = initialized;
   }
 }
 
