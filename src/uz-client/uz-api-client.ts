@@ -150,8 +150,8 @@ export class UzApiClient {
         logger.warn({ err: String(err) }, 'booking.uz.gov.ua load timeout, continuing...');
       }
 
-      // Намагаємося витягнути session ID з localStorage (з app.uz.gov.ua)
-      const sessionId = await this.appPage.evaluate((): string | null => {
+      // Намагаємося витягнути session ID з localStorage (він зберігається на booking.uz.gov.ua)
+      const sessionId = await this.bookingPage.evaluate((): string | null => {
         const raw = localStorage.getItem('Symbol(AUTH_STORE_ID)');
         if (!raw) return null;
         try { return JSON.parse(raw).sessionId ?? null; } catch { return null; }
