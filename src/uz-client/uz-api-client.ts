@@ -155,8 +155,12 @@ export class UzApiClient {
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
       });
 
-      await this.browserPage.goto('https://booking.uz.gov.ua/', { waitUntil: 'networkidle', timeout: 45000 });
-      await this.browserPage.waitForTimeout(3000);
+      try {
+        await this.browserPage.goto('https://booking.uz.gov.ua/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+        await this.browserPage.waitForTimeout(5000); // Give it a few seconds to run React scripts
+      } catch (err) {
+        logger.warn({ err: String(err) }, 'Page load timeout, but continuing...');
+      }
 
       const sessionId = await this.browserPage.evaluate((): string | null => {
         const raw = localStorage.getItem('Symbol(AUTH_STORE_ID)');
