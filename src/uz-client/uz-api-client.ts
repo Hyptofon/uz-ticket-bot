@@ -63,7 +63,8 @@ export class UzApiClient {
 
   // Постійний браузер Google Chrome для обходу Cloudflare Turnstile
   private browserContext: any = null;
-  private browserPage: any = null;
+  private appPage: any = null;
+  private bookingPage: any = null;
   private browserInitPromise: Promise<void> | null = null;
   private browserSessionId: string | null = null;
   private sessionRefreshedAt: number = 0;
@@ -86,7 +87,7 @@ export class UzApiClient {
    * Всі API-запити йдуть через браузер — так обходиться Cloudflare TLS-fingerprinting.
    */
   async ensureBrowserReady(): Promise<void> {
-    if (this.browserPage) return;
+    if (this.appPage && this.bookingPage) return;
     if (this.browserInitPromise) return this.browserInitPromise;
 
     this.browserInitPromise = (async () => {
@@ -116,35 +117,41 @@ export class UzApiClient {
         ],
       });
 
-      this.browserPage = await this.browserContext.newPage();
-      await this.browserPage.addInitScript(() => {
+      // Створюємо дві окремі сторінки, щоб усі запити були same-origin і не блокувалися CORS
+      this.appPage = await this.browserContext.newPage();
+      await this.appPage.addInitScript(() => {
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
       });
 
-      // 1. Відвідуємо спочатку app.uz.gov.ua (для trips/stations API)
+      this.bookingPage = await this.browserContext.newPage();
+      await this.bookingPage.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      });
+
+      // 1. Відвідуємо app.uz.gov.ua (для trips/stations API)
       try {
-        await this.browserPage.goto('https://app.uz.gov.ua/', {
+        await this.appPage.goto('https://app.uz.gov.ua/', {
           waitUntil: 'domcontentloaded',
           timeout: 45000,
         });
-        await this.browserPage.waitForTimeout(3000);
+        await this.appPage.waitForTimeout(3000);
       } catch (err) {
         logger.warn({ err: String(err) }, 'app.uz.gov.ua load timeout, continuing...');
       }
 
       // 2. Відвідуємо booking.uz.gov.ua (для wagons API)
       try {
-        await this.browserPage.goto('https://booking.uz.gov.ua/', {
+        await this.bookingPage.goto('https://booking.uz.gov.ua/', {
           waitUntil: 'domcontentloaded',
           timeout: 45000,
         });
-        await this.browserPage.waitForTimeout(3000);
+        await this.bookingPage.waitForTimeout(3000);
       } catch (err) {
         logger.warn({ err: String(err) }, 'booking.uz.gov.ua load timeout, continuing...');
       }
 
-      // Намагаємося витягнути session ID з localStorage
-      const sessionId = await this.browserPage.evaluate((): string | null => {
+      // Намагаємося витягнути session ID з localStorage (з app.uz.gov.ua)
+      const sessionId = await this.appPage.evaluate((): string | null => {
         const raw = localStorage.getItem('Symbol(AUTH_STORE_ID)');
         if (!raw) return null;
         try { return JSON.parse(raw).sessionId ?? null; } catch { return null; }
@@ -168,7 +175,7 @@ export class UzApiClient {
   /**
    * Виконує fetch всередині Google Chrome через page.evaluate.
    * Chrome вже пройшов Cloudflare, тому всі запити проходять без блокування.
-   * contentType — 'application/json' (default) або 'application/x-www-form-urlencoded'
+   * Вибирається сторінка з відповідним origin, щоб уникнути будь-яких CORS помилок.
    */
   private async fetchViaBrowser(
     url: string,
@@ -179,7 +186,9 @@ export class UzApiClient {
     await this.ensureBrowserReady();
     await rateLimitWait();
 
-    const result = await this.browserPage.evaluate(
+    const pageToUse = url.includes('app.uz.gov.ua') ? this.appPage : this.bookingPage;
+
+    const result = await pageToUse.evaluate(
       async ({ reqUrl, reqMethod, reqBody, reqContentType, sessionId }: any) => {
         const headers: Record<string, string> = {
           'Accept': 'application/json, text/plain, */*',
@@ -233,7 +242,8 @@ export class UzApiClient {
     logger.warn('Refreshing browser session manually...');
     if (this.browserContext) {
       await this.browserContext.close().catch(() => {});
-      this.browserPage = null;
+      this.appPage = null;
+      this.bookingPage = null;
       this.browserContext = null;
       this.browserInitPromise = null;
     }
