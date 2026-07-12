@@ -63,8 +63,7 @@ export class UzApiClient {
 
   // Постійний браузер Google Chrome для обходу Cloudflare Turnstile
   private browserContext: any = null;
-  private appPage: any = null;
-  private bookingPage: any = null;
+  private browserPage: any = null;
   private browserInitPromise: Promise<void> | null = null;
   private browserSessionId: string | null = null;
   private sessionRefreshedAt: number = 0;
@@ -87,74 +86,45 @@ export class UzApiClient {
    * Всі API-запити йдуть через браузер — так обходиться Cloudflare TLS-fingerprinting.
    */
   async ensureBrowserReady(): Promise<void> {
-    if (this.appPage && this.bookingPage) return;
+    if (this.browserPage) return;
     if (this.browserInitPromise) return this.browserInitPromise;
 
     this.browserInitPromise = (async () => {
-      logger.info('Initializing persistent background browser for Cloudflare bypass...');
+      logger.info('Initializing background browser for Cloudflare bypass...');
       const { chromium } = require('playwright-extra');
       const stealth = require('puppeteer-extra-plugin-stealth')();
       chromium.use(stealth);
 
-      // Видаляємо SingletonLock файл блокування Chrome, який міг лишитися з минулого запуску.
-      // Не використовуємо existsSync, бо для битих символьних лінків на Linux він повертає false.
-      const lockFile = path.join(this.profileDir, 'SingletonLock');
-      try {
-        fs.rmSync(lockFile, { force: true });
-      } catch (e) {}
-
-      fs.mkdirSync(this.profileDir, { recursive: true });
-
-      this.browserContext = await chromium.launchPersistentContext(this.profileDir, {
+      this.browserContext = await chromium.launch({
         headless: true,
         channel: 'chrome',
-        userAgent: this.currentUA,
         args: [
           '--no-sandbox',
           '--disable-blink-features=AutomationControlled',
           '--disable-web-security',
-          '--allow-running-insecure-content',
+          '--disable-features=IsolateOrigins,site-per-process',
         ],
       });
 
-      // Створюємо дві окремі сторінки, щоб усі запити були same-origin і не блокувалися CORS
-      this.appPage = await this.browserContext.newPage();
-      await this.appPage.addInitScript(() => {
+      this.browserPage = await this.browserContext.newPage();
+      await this.browserPage.addInitScript(() => {
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
       });
 
-      this.bookingPage = await this.browserContext.newPage();
-      await this.bookingPage.addInitScript(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-      });
-
-      // 1. Відвідуємо app.uz.gov.ua (для trips/stations API)
+      // Відвідуємо booking.uz.gov.ua
       try {
-        await this.appPage.goto('https://app.uz.gov.ua/', {
+        await this.browserPage.goto('https://booking.uz.gov.ua/', {
           waitUntil: 'domcontentloaded',
           timeout: 45000,
         });
-        await this.appPage.waitForTimeout(3000);
-      } catch (err) {
-        logger.warn({ err: String(err) }, 'app.uz.gov.ua load timeout, continuing...');
-      }
-
-      // 2. Відвідуємо booking.uz.gov.ua (для wagons API)
-      try {
-        await this.bookingPage.goto('https://booking.uz.gov.ua/', {
-          waitUntil: 'domcontentloaded',
-          timeout: 45000,
-        });
-        await this.bookingPage.waitForTimeout(3000);
       } catch (err) {
         logger.warn({ err: String(err) }, 'booking.uz.gov.ua load timeout, continuing...');
       }
 
-      // Намагаємося витягнути session ID з localStorage (він зберігається на booking.uz.gov.ua)
       // Додаємо polling, бо React застосунок може ініціалізуватися довго
       let sessionId = null;
       for (let i = 0; i < 15; i++) {
-        sessionId = await this.bookingPage.evaluate((): string | null => {
+        sessionId = await this.browserPage.evaluate((): string | null => {
           const raw = localStorage.getItem('Symbol(AUTH_STORE_ID)');
           if (!raw) return null;
           try { return JSON.parse(raw).sessionId ?? null; } catch { return null; }
@@ -195,9 +165,7 @@ export class UzApiClient {
     await this.ensureBrowserReady();
     await rateLimitWait();
 
-    const pageToUse = url.includes('app.uz.gov.ua') ? this.appPage : this.bookingPage;
-
-    const result = await pageToUse.evaluate(
+    const result = await this.browserPage.evaluate(
       async ({ reqUrl, reqMethod, reqBody, reqContentType, sessionId }: any) => {
         const headers: Record<string, string> = {
           'Accept': 'application/json, text/plain, */*',
@@ -251,8 +219,7 @@ export class UzApiClient {
     logger.warn('Refreshing browser session manually...');
     if (this.browserContext) {
       await this.browserContext.close().catch(() => {});
-      this.appPage = null;
-      this.bookingPage = null;
+      this.browserPage = null;
       this.browserContext = null;
       this.browserInitPromise = null;
     }
