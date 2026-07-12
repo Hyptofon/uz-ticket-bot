@@ -151,15 +151,24 @@ export class UzApiClient {
       }
 
       // Намагаємося витягнути session ID з localStorage (він зберігається на booking.uz.gov.ua)
-      const sessionId = await this.bookingPage.evaluate((): string | null => {
-        const raw = localStorage.getItem('Symbol(AUTH_STORE_ID)');
-        if (!raw) return null;
-        try { return JSON.parse(raw).sessionId ?? null; } catch { return null; }
-      }).catch(() => null);
+      // Додаємо polling, бо React застосунок може ініціалізуватися довго
+      let sessionId = null;
+      for (let i = 0; i < 15; i++) {
+        sessionId = await this.bookingPage.evaluate((): string | null => {
+          const raw = localStorage.getItem('Symbol(AUTH_STORE_ID)');
+          if (!raw) return null;
+          try { return JSON.parse(raw).sessionId ?? null; } catch { return null; }
+        }).catch(() => null);
+        
+        if (sessionId) break;
+        await this.bookingPage.waitForTimeout(1000);
+      }
 
       if (sessionId) {
         this.browserSessionId = sessionId;
         logger.info({ sessionId }, 'Harvested real x-session-id');
+      } else {
+        logger.warn('Failed to harvest x-session-id after 15 seconds of polling. Train search may fail with 441.');
       }
 
       this.sessionInitialized = true;
