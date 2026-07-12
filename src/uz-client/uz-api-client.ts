@@ -131,7 +131,7 @@ export class UzApiClient {
         }).catch(() => null);
         
         if (sessionId) break;
-        await this.bookingPage.waitForTimeout(1000);
+        await this.browserPage.waitForTimeout(1000);
       }
 
       if (sessionId) {
